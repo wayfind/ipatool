@@ -387,7 +387,10 @@ func decryptImage(output []byte, image encryptedImage, records [][32]byte, mask 
 	structurallyPlausible := false
 	if isARM64InstructionSet(image.layout.cpuType) {
 		valid, instructionWords, mnemonics = auditARM64FirstPage(first, uint64(start), image.layout.instructionRanges)
-		structurallyPlausible = instructionWords > 0 && valid*100 >= instructionWords*minimumARM64InstructionValidPercent
+		// The encrypted region may start before any instruction section
+		// (universal slices often place __text past the first page), in which
+		// case there is nothing to decode on this page and the audit passes.
+		structurallyPlausible = instructionWords == 0 || valid*100 >= instructionWords*minimumARM64InstructionValidPercent
 		if !structurallyPlausible {
 			return nil, fmt.Errorf("%s: first executable page has only %d/%d valid ARM64 words", image.member, valid, instructionWords)
 		}
