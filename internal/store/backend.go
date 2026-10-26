@@ -11,6 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +32,20 @@ type Backend struct {
 	bag           map[string]any
 	transport     *http.Transport
 	authTransport *http.Transport
+
+	// lastStoreError holds the most recent Apple error payload observed by the
+	// transport. The guest frameworks occasionally crash while rendering an
+	// error dialog (losing the server's message), so the transport records it
+	// here to enrich the returned error.
+	lastStoreError *StoreErrorInfo
+}
+
+// StoreErrorInfo carries the semantic fields of an Apple Store error response.
+type StoreErrorInfo struct {
+	FailureType     string
+	CustomerMessage string
+	DialogID        string
+	URL             string
 }
 
 type executor struct {
@@ -206,6 +223,17 @@ func (b *Backend) execute(ctx context.Context, input emulator.Request) (*http.Re
 
 	response, err := guest.Execute(input)
 	if err != nil {
+		// The guest frameworks sometimes crash while rendering an Apple error
+		// dialog, losing the server's message. Enrich the failure with the
+		// error payload the transport observed for this operation.
+		b.mu.Lock()
+		last := b.lastStoreError
+		b.mu.Unlock()
+
+		if last != nil {
+			return nil, fmt.Errorf("store request: %w (Apple: failureType=%s dialog=%s message=%q)", err, last.FailureType, last.DialogID, last.CustomerMessage)
+		}
+
 		return nil, fmt.Errorf("store request: %w", err)
 	}
 
@@ -298,6 +326,128 @@ func (b *Backend) requestTransport(input emulator.Request) func(*http.Request) (
 			return nil, fmt.Errorf("store HTTP transport: %w", err)
 		}
 
+		if os.Getenv("IPATOOL_DEBUG_STORE") != "" {
+			dumpStoreResponse(request, response)
+		}
+
+		b.recordStoreError(request.URL.String(), response)
+
 		return response, nil
 	}
+}
+
+// recordStoreError peeks at a Store response and, when it carries an Apple
+// error payload, remembers its semantic fields for later error enrichment.
+func (b *Backend) recordStoreError(url string, response *http.Response) {
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return
+	}
+	_ = response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+
+	info := &StoreErrorInfo{URL: url}
+
+	payload := body
+	if strings.EqualFold(response.Header.Get("Content-Encoding"), "gzip") {
+		if reader, e := gzip.NewReader(bytes.NewReader(body)); e == nil {
+			if decoded, e := io.ReadAll(io.LimitReader(reader, 1<<20)); e == nil {
+				payload = decoded
+			}
+			_ = reader.Close()
+		}
+	}
+
+	if plist, e := plistlibDecode(payload); e == nil && plist != nil {
+		info.FailureType, _ = plist["failureType"].(string)
+		info.CustomerMessage, _ = plist["customerMessage"].(string)
+		if metrics, ok := plist["metrics"].(map[string]any); ok {
+			info.DialogID, _ = metrics["dialogId"].(string)
+		}
+	}
+
+	if info.FailureType == "" && info.DialogID == "" {
+		return
+	}
+
+	b.mu.Lock()
+	b.lastStoreError = info
+	b.mu.Unlock()
+}
+
+// dumpStoreResponse writes the raw Store response to a debug directory when
+// IPATOOL_DEBUG_STORE is set. The Apple frameworks running inside the emulator
+// sometimes crash before surfacing the server's error message (for example
+// storefront-availability rejections), so this preserves the original payload
+// for diagnosis.
+func dumpStoreResponse(request *http.Request, response *http.Response) {
+	dir := os.Getenv("IPATOOL_DEBUG_STORE")
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+
+	safe := strings.NewReplacer(":", "", "/", "_", "?", "_", "&", "_", "=", "_").Replace(request.URL.Path)
+	if safe == "" || safe == "_" {
+		safe = strings.NewReplacer(":", "", "/", "_", "?", "_", "&", "_", "=", "_").Replace(request.URL.Host)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return
+	}
+	_ = response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+
+	name := fmt.Sprintf("%s/%s-%s.bin", dir, time.Now().Format("150405"), safe)
+	if writeErr := os.WriteFile(name, body, 0o600); writeErr != nil {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "store debug: %s %s -> %s (%d bytes, status %d)\n",
+		request.Method, request.URL, name, len(body), response.StatusCode)
+}
+
+// plistlibDecode is a minimal XML plist reader for error enrichment. It only
+// understands the flat string/integer dictionaries Apple returns for errors.
+func plistlibDecode(data []byte) (map[string]any, error) {
+	result := make(map[string]any)
+	text := string(data)
+
+	keyRe := regexp.MustCompile(`<key>([^<]+)</key>`)
+	stringRe := regexp.MustCompile(`<string>([^<]*)</string>`)
+	intRe := regexp.MustCompile(`<integer>(\d+)</integer>`)
+
+	// Extract top-level keys in document order; values are the next
+	// string/integer/array element following each key.
+	keys := keyRe.FindAllStringSubmatchIndex(text, -1)
+	for _, key := range keys {
+		name := text[key[2]:key[3]]
+		rest := text[key[1]:]
+		if strings.HasPrefix(rest, "<array>") {
+			result[name] = []any{}
+			continue
+		}
+		if m := stringRe.FindStringSubmatch(rest); m != nil {
+			result[name] = htmlUnescapeMinimal(m[1])
+			continue
+		}
+		if m := intRe.FindStringSubmatch(rest); m != nil {
+			if v, e := strconv.ParseInt(m[1], 10, 64); e == nil {
+				result[name] = v
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func htmlUnescapeMinimal(s string) string {
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", "\"")
+	return s
 }

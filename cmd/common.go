@@ -59,13 +59,24 @@ func newCookieJar(stateDirectory string) http.CookieJar {
 }
 
 // newKeychain returns a new keychain instance.
+// When the IPATOOL_FILE_KEYRING environment variable is set, credentials are
+// stored in an encrypted file inside the state directory instead of the macOS
+// Keychain. This avoids repeated access prompts that macOS shows whenever the
+// binary changes (e.g. after rebuilding), because Keychain ACLs are tied to
+// the code signature of the binary that created the item.
 func newKeychain(stateDirectory string, interactive bool) keychain.Keychain {
+	allowedBackends := []keyring.BackendType{
+		keyring.KeychainBackend,
+		keyring.SecretServiceBackend,
+		keyring.FileBackend,
+	}
+
+	if os.Getenv("IPATOOL_FILE_KEYRING") != "" {
+		allowedBackends = []keyring.BackendType{keyring.FileBackend}
+	}
+
 	ring := util.Must(openKeyring(keyring.Config{
-		AllowedBackends: []keyring.BackendType{
-			keyring.KeychainBackend,
-			keyring.SecretServiceBackend,
-			keyring.FileBackend,
-		},
+		AllowedBackends:          allowedBackends,
 		ServiceName:              KeychainServiceName,
 		KeychainTrustApplication: true,
 		FileDir:                  stateDirectory,
